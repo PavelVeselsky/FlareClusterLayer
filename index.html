@@ -80,9 +80,12 @@
             parseOnLoad: false,
             async: true,
             tlmSiblingOfDojo: false,
+            /*paths: {
+                cluster: '@Url.Content("/portal/Modules/Georeal.SpiritJS/Scripts/cluster-layer/src")'
+            }*/
             packages: [{
-                name: "ncam",
-                location: location.pathname.replace(/\/[^/]+$/, '') + "ncam"
+                name: "cluster",
+                location: location.pathname.replace('test', '').replace(/\/[^/]+$/, '') + "src"
             }]
         };
     </script>
@@ -96,19 +99,20 @@
         var graphics;
         var clusterLayer;
 
-       //set some defaults
+        //set some defaults
         var preClustered = false;
         var displaySingleFlaresAtCount = 10;
         var areaDisplayMode = "hover";
 
-        require(["esri/map", "esri/layers/graphics", "esri/graphic", "esri/dijit/PopupTemplate", "ncam/FlareClusterLayer",
+        require(["esri/map", "esri/layers/graphics", "esri/graphic", "esri/dijit/PopupTemplate", "cluster/FlareClusterLayer", //"cluster/DataManager",
                "esri/symbols/SimpleMarkerSymbol", "esri/symbols/SimpleLineSymbol", "esri/symbols/SimpleFillSymbol", "esri/renderers/ClassBreaksRenderer",
                 "dojo/ready", "dojo/json", "dojo/dom", "dojo/on", "dojo/text!./data.json"],
-        function (Map, GraphicsLayer, Graphic, PopupTemplate, FlareClusterLayer, SimpleMarkerSymbol, SimpleLineSymbol, SimpleFillSymbol, ClassBreaksRenderer, ready, JSON, dom, on, data) {
+        function (Map, GraphicsLayer, Graphic, PopupTemplate, FlareClusterLayer, /*dm,*/ SimpleMarkerSymbol, SimpleLineSymbol, SimpleFillSymbol, ClassBreaksRenderer, ready, JSON, dom, on, data) {
 
             //load up the dummy data
             var allData = JSON.parse(data);
             DataManager.setData(allData);
+            //dm.setData(allData);
 
             ready(function () {
 
@@ -272,8 +276,8 @@
 
             <label>Clustering mode:</label>
             <select id="clustering-mode">
-                <option value="server">Fake server side</option>
                 <option value="client">Client side</option>
+                <option value="server">Fake server side</option>
             </select>
 
             <label>Display cluster area mode:</label>

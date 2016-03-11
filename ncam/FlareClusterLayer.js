@@ -1,4 +1,4 @@
-﻿define([
+﻿define("cluster/FlareClusterLayer", [
   "dojo/_base/declare",
   "dojo/_base/lang",
   "dojo/_base/array",
@@ -26,15 +26,20 @@
   "esri/symbols/SimpleLineSymbol",
   "esri/symbols/TextSymbol",
 
+  "dojo/when",
+  "dojo/Deferred",
+  "dojo/promise/all",
+
+  "esri/geometry/scaleUtils",
   "esri/dijit/PopupTemplate",
   "esri/layers/GraphicsLayer"
 ], function (
   declare, lang, arrayUtils, on, coreFx, gfx, fx, tap,
   SpatialReference, Extent, Multipoint, Point, Polygon, ScreenPoint, webMercatorUtils, geometryEngine, Graphic,
-  Color, ClassBreaksRenderer, Font, SimpleMarkerSymbol, SimpleFillSymbol, SimpleLineSymbol, TextSymbol,
-  PopupTemplate, GraphicsLayer
+  Color, ClassBreaksRenderer, Font, SimpleMarkerSymbol, SimpleFillSymbol, SimpleLineSymbol, TextSymbol, when, Deferred, all,
+  ScaleUtils, PopupTemplate, GraphicsLayer
 ) {
-    return declare([GraphicsLayer], {
+    return declare("cluster.FlareClusterLayer", [GraphicsLayer], {
         constructor: function (options) {
             /* options description:
               spatialReference: default 102100. A SpatialReference object using the wkid of that data.
@@ -59,13 +64,17 @@
             //set options from constructor parameter or set defaults
             options = options || {};
             this.spatialRef = options.spatialReference || new SpatialReference({ "wkid": 102100 });
+            //test
+            this.spatialReference = options.spatialReference || new SpatialReference({ "wkid": 102100 });
+
             this.preClustered = options.preClustered === true;
             this.clusterRatio = options.clusterRatio || 75;
 
             this.displaySubTypeFlares = options.displaySubTypeFlares === true;
             this.subTypeFlareProperty = options.subTypeFlareProperty || null;
 
-            this.flareColor = options.flareColor || new Color([0, 0, 0, 0.5]);
+            //this.flareColor = options.flareColor || new Color([0, 0, 0, 0.5]);
+            this.flareColor = options.flareColor || new Color([128, 0, 0, 0.5]);
             this.maxFlareCount = options.maxFlareCount || 8;
             this.displaySingleFlaresAtCount = options.displaySingleFlaresAtCount || 8;
             this.singleFlareTooltipProperty = options.singleFlareTooltipProperty || null;
@@ -107,6 +116,12 @@
             this.clusters = [];
             this.singles = [];
 
+            //counters to help determine when all the data are processed
+
+            this._graphicProcessingCounter = 0;
+            this._graphicProcessingThreshold = 0;
+            this._clusterDataFinished = false;
+            this._reclusterListen = false;
         },
 
 
@@ -129,8 +144,9 @@
             this.events.push(on(this.map, "resize", lang.hitch(this, this._mapResize)));
 
             //add pan and zoom events to limit to recluster
-            this.events.push(on(this.map, "extent-change", lang.hitch(this, this._clusterData)));
-
+            //this.events.push(on(this.map, "extent-change", lang.hitch(this, this._clusterData))); //this fired before loading the data
+            this.events.push(on(this.map, "extent-change", lang.hitch(this, this._clusterRefresh)));
+            this.events.push(on(this.map, "update-end", lang.hitch(this, this._clusterData)));
             //Handle click event at the map level
             this.events.push(on(this.map, "click", lang.hitch(this, this._mapClick)));
 
@@ -145,7 +161,6 @@
 
             return this.inherited(arguments);
         },
-
 
         _unsetMap: function () {
             this.inherited(arguments);
@@ -210,8 +225,13 @@
 
                 this.map.infoWindow.cluster = this.activeCluster;
 
-                //reset the geometry of the flare feature in the info window to be the actual location of the flared object, not the location of the flare graphic.
-                var p = webMercatorUtils.geographicToWebMercator(new Point(flareObject.singleData.x, flareObject.singleData.y, this.spatialRef));
+                var p;
+                if (ScaleUtils.getUnitValueForSR(this.spatialRef) !== 1) {
+                    //reset the geometry of the flare feature in the info window to be the actual location of the flared object, not the location of the flare graphic.
+                    p = webMercatorUtils.geographicToWebMercator(new Point(flareObject.singleData.x, flareObject.singleData.y, this.spatialRef));
+                } else {
+                    p = new Point(flareObject.singleData.x, flareObject.singleData.y, this.spatialRef);
+                }
                 this.map.infoWindow.features[0].geometry = p;
                 this.map.infoWindow.show(sp);
 
@@ -239,8 +259,12 @@
                 return;
             }
 
-            //get an extent that is in web mercator to make sure it's flat for extent checking
-            var webExtent = webMercatorUtils.project(map.extent, new SpatialReference({ "wkid": 102100 }));
+            //if necessary, get an extent that is in web mercator to make sure it's flat for extent checking
+            if (ScaleUtils.getUnitValueForSR(this.spatialRef) !== 1) {
+                var webExtent = webMercatorUtils.project(map.extent, new SpatialReference({ "wkid": 102100 }));
+            } else {
+                var webExtent = map.extent;
+            }
             if (!this.gridClusters || this.gridClusters.length === 0) {
                 this._createClusterGrid();
             }
@@ -255,6 +279,8 @@
             //get a web merc lng/lat for extent checking. Use web merc as it's flat to cater for longitude pole
             if (this.spatialRef.isWebMercator()) {
                 web = [obj.x, obj.y];
+            } else if (ScaleUtils.getUnitValueForSR(this.spatialRef) === 1) {
+                web = obj.geometry.points[0];   //optimized for our data
             } else {
                 web = webMercatorUtils.lngLatToXY(obj.x, obj.y);
             }
@@ -273,12 +299,12 @@
                 }
 
                 //recalc the x and y of the cluster by averaging the points again
-                cl.x = cl.clusterCount > 0 ? (obj.x + (cl.x * cl.clusterCount)) / (cl.clusterCount + 1) : obj.x;
-                cl.y = cl.clusterCount > 0 ? (obj.y + (cl.y * cl.clusterCount)) / (cl.clusterCount + 1) : obj.y;
+                cl.x = cl.clusterCount > 0 ? (web[0] + (cl.x * cl.clusterCount)) / (cl.clusterCount + 1) : web[0];
+                cl.y = cl.clusterCount > 0 ? (web[1] + (cl.y * cl.clusterCount)) / (cl.clusterCount + 1) : web[1];
 
                 //push every point into the cluster so we have it for area display if required. This could be omitted if never checking areas, or on demand at least
                 if (this.clusterAreaDisplay) {
-                    cl.points.push([obj.x, obj.y]);
+                    cl.points.push([web[0], web[1]]);
                 }
 
                 cl.clusterCount++;
@@ -350,6 +376,7 @@
 
         //#endregion
 
+
         //#region other event handlers
 
         _mapResize: function () {
@@ -362,6 +389,7 @@
                 return;
             }
 
+            this.map.graphics.redraw();
             var targetClass = e.target.getAttribute("class");
             if (!targetClass || targetClass.indexOf("cluster-object") === -1) {
                 //if this was not a cluster object at all then clear any active one and return
@@ -377,6 +405,12 @@
         },
 
         _graphicDraw: function (e) {
+            //otherwise all the graphics will get drawn twice, I don|t know why
+            this._graphicProcessingCounter++;
+            if (this._graphicProcessingCounter > this._graphicProcessingThreshold) {
+                return;
+            }
+
             var g = e.graphic;
             if (g.attributes.isCluster) {
                 //create the cluster graphics if this is a cluster being drawn
@@ -391,7 +425,10 @@
                 sh.moveToBack();
             }
 
-
+            //find out when we are finished, to run the clusteringComplete callback function in the right time
+            if (this._clusterDataFinished && this._graphicProcessingCounter == this._graphicProcessingThreshold) {
+                this._finished();
+            }
             return this.inherited(arguments);
         },
 
@@ -423,7 +460,6 @@
             }
         },
 
-
         _infoWindowShow: function (e) {
             for (var i = 0; i < this.map.infoWindow.features.length; i++) {
                 if (this.map.infoWindow.features[i].attributes.isCluster || this.map.infoWindow.features[i].attributes.isClusterArea) {
@@ -437,9 +473,7 @@
             this.map.infoWindow.cluster = null;
         },
 
-
         //#endregion
-
 
 
         //#region extra public methods
@@ -449,7 +483,7 @@
                 Add data that is preclustered - (ie clustered server side).
                 Data is an array, clusters must contain an x and y property as well as a clusterCount property. subTypeCounts is optional. 
                 Clusters that have a count less than the this.displaySingleFlaresAtCount option must all contain the data for the single points in an array called singles
-               Singles should also be in the array, they only need to contain an x and y property. Singles should also contain whatever property is set in singleFlareTooltipProperty, so the flare tooltip has something to display for summary flares if needed
+                Singles should also be in the array, they only need to contain an x and y property. Singles should also contain whatever property is set in singleFlareTooltipProperty, so the flare tooltip has something to display for summary flares if needed
             */
 
             if (this.clusteringBegin) {
@@ -476,16 +510,10 @@
 
 
         addData: function (data) {
-            /*
-                Add data to be clustered.
-                Data is an array of objects. Each object passed in must contain an x and y property. 
-                Data should also contain whatever property is set in singleFlareTooltipProperty if one is set, so the flare tooltip has something to display for summary flares if needed
-                This will also clear all data first. add() can be used to add single objects at any time.
-            */
+            this._reclusterListen = true;
             this.allData = data;
             this._clusterData();
         },
-
 
         //#endregion
 
@@ -499,30 +527,49 @@
             }
         },
 
-        _clusterData: function () {
+        _clusterRefresh: function () {
+            //tells the listener that data load started, to fire _clusterData when loading is finished
+            this._reclusterListen = true;
+        },
 
+        _clusterData: function () {
             //this function currently only applies if not using preclustered data
             if (this.preClustered) {
+                return;
+            }
+
+            if (this._reclusterListen) {
+                this._reclusterListen = false;
+            } else {
                 return;
             }
 
             if (this.clusteringBegin) {
                 this.clusteringBegin();
             }
+            //counters to fire the finishing function in the right moment
+            this._graphicProcessingCounter = 0;
+            this._graphicProcessingThreshold = 0;
 
             this.clear();
-
+            
             //get an extent that is in web mercator to make sure it's flat for extent checking
-            var webExtent = webMercatorUtils.project(this.map.extent, new SpatialReference({ "wkid": 102100 }));
+            if (ScaleUtils.getUnitValueForSR(this.spatialRef) !== 1) {
+                var webExtent = webMercatorUtils.project(this.map.extent, new SpatialReference({ "wkid": 102100 }));
+            } else {
+                var webExtent = this.map.extent;
+            }
             this._createClusterGrid(webExtent);
 
-            var dataLength = this.allData.length;
+            //var dataLength = this.allData.length; //sometimes fires before loading all data, omiting the rest
             var web, obj;
-            for (var i = 0; i < dataLength; i++) {
+            for (var i = 0; i < this.allData.length; i++) {
                 obj = this.allData[i];
                 //get a web merc lng/lat for extent checking. Use web merc as it's flat to cater for longitude pole
                 if (this.spatialRef.isWebMercator()) {
                     web = [obj.x, obj.y];
+                } else if (ScaleUtils.getUnitValueForSR(this.spatialRef) === 1) {
+                    web = obj.geometry.points[0];   //optimized for our data
                 } else {
                     web = webMercatorUtils.lngLatToXY(obj.x, obj.y);
                 }
@@ -541,12 +588,12 @@
                     }
 
                     //recalc the x and y of the cluster by averaging the points again
-                    cl.x = cl.clusterCount > 0 ? (obj.x + (cl.x * cl.clusterCount)) / (cl.clusterCount + 1) : obj.x;
-                    cl.y = cl.clusterCount > 0 ? (obj.y + (cl.y * cl.clusterCount)) / (cl.clusterCount + 1) : obj.y;
+                    cl.x = cl.clusterCount > 0 ? (web[0] + (cl.x * cl.clusterCount)) / (cl.clusterCount + 1) : web[0];
+                    cl.y = cl.clusterCount > 0 ? (web[1] + (cl.y * cl.clusterCount)) / (cl.clusterCount + 1) : web[1];
 
                     //push every point into the cluster so we have it for area display if required. This could be omitted if never checking areas, or on demand at least
                     if (this.clusterAreaDisplay) {
-                        cl.points.push([obj.x, obj.y]);
+                        cl.points.push([web[0], web[1]]);
                     }
 
                     cl.clusterCount++;
@@ -562,20 +609,36 @@
                     if (!subTypeExists) {
                         cl.subTypeCounts.push({ name: obj.facilityType, count: 1 });
                     }
-
+                    
                     cl.singles.push(obj);
                 }
             }
 
-            for (var i = 0, len = this.gridClusters.length; i < len; i++) {
-                if (this.gridClusters[i].clusterCount === 1) {
-                    this._createSingle(this.gridClusters[i].singles[0]);
+            for (var k = 0; k < this.gridClusters.length; k++) {
+                //count number of graphics to be drawn
+                if (this.gridClusters[k].clusterCount > 0) {
+                    this._graphicProcessingThreshold++;
                 }
-                else if (this.gridClusters[i].clusterCount > 0) {
-                    this._createCluster(this.gridClusters[i]);
+                if (this.gridClusters[k].clusterCount === 1) {
+                    this._createSingle(this.gridClusters[k].singles[0]);
+                }
+                else if (this.gridClusters[k].clusterCount > 0) {
+                    this._createCluster(this.gridClusters[k]);
                 }
             }
 
+            if (this._graphicProcessingCounter === this._graphicProcessingThreshold) {
+                this._finished();
+            } else {
+                this._clusterDataFinished = true;
+            }
+        },
+
+        _finished: function()   {
+            if (this.clusteringComplete) {
+                this.clusteringComplete();
+            }
+            //this.redraw();
         },
 
         _createClusterGrid: function (webExtent) {
@@ -598,7 +661,7 @@
                     gsymin = webExtent.ymin + (yh * j);
                     gsymax = gsymin + yh;
                     var ext = new Extent({ xmin: gsxmin, xmax: gsxmax, ymin: gsymin, ymax: gsymax });
-                    ext.setSpatialReference(new SpatialReference({ "wkid": 102100 }));
+                    ext.setSpatialReference(this.spatialRef);
                     this.gridClusters.push({
                         extent: ext,
                         clusterCount: 0,
@@ -608,20 +671,29 @@
                     });
                 }
             }
-
         },
 
-        _createSingle: function (single) {
+        _createSingle: function (single, callback) {
+            if (typeof single.x === "undefined") {
+                single.x = single.geometry.points[0][0];
+                single.y = single.geometry.points[0][1];
+            }
             this.singles.push(single);
             delete single.graphic;
             var point = new Point(single.x, single.y, this.spatialRef);
-            var attributes = lang.clone(single);
-            var graphic = new Graphic(point, null, attributes, null);
+            //var attributes = lang.clone(single);
+            //var attributes = new esri.Graphic(cl.graphic.geometry, cl.graphic.symbol, cl.graphic.attributes, this.infoTemplate);
+            //instead of "single" there should be a deep copy, but that's difficult for cyclic objects
+            //var graphic = new Graphic(point, null, single, null);
+            var graphic = new esri.Graphic(single.geometry, null, single.attributes, this.infoTemplate);
+            graphic.setSymbol(this.renderer.getSymbol(graphic));
+            graphic.x = single.x;
+            graphic.y = single.y;
             single.graphic = graphic;
             this.add(graphic);
         },
 
-        _createCluster: function (cluster) {
+        _createCluster: function (cluster, callback) {
 
             this.clusters.push(cluster);
 
@@ -658,11 +730,11 @@
             }
 
             attributes.isCluster = true;
-            var graphic = new Graphic(point, null, attributes, null);
+            var graphic = new Graphic(point, null, attributes, this.infoTemplate);
+            graphic.setSymbol(this.renderer.getSymbol(graphic));
             cluster.graphic = graphic;
             cluster.areaGraphic = areaGraphic;
             this.add(graphic);
-
         },
 
         _createClusterGraphic: function (cluster) {
